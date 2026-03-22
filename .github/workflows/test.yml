@@ -16,18 +16,18 @@ jobs:
       - uses: actions/checkout@v3
       
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: wasm32-unknown-unknown
-          override: true
+          targets: wasm32-unknown-unknown
           components: rustfmt, clippy
 
       - name: Install Stellar CLI
         run: |
           wget https://github.com/stellar/stellar-cli/releases/download/v25.1.0/stellar-cli-25.1.0-x86_64-unknown-linux-gnu.tar.gz
           tar -xzf stellar-cli-25.1.0-x86_64-unknown-linux-gnu.tar.gz
-          sudo mv stellar-cli-25.1.0-x86_64-unknown-linux-gnu/stellar /usr/local/bin/
+          # Find the stellar binary and move it to /usr/local/bin
+          find . -maxdepth 2 -name stellar -type f -exec sudo mv {} /usr/local/bin/ \;
+          stellar --version
 
       - name: Build Contract
         run: cargo build --target wasm32-unknown-unknown --release
