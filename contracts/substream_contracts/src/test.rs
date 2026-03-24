@@ -1,6 +1,10 @@
 #![cfg(test)]
 
 use super::*;
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token, Address, Env,
+};
 use soroban_sdk::{ testutils::{ Address as _, Ledger }, token, Address, Env };
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger};
 use soroban_sdk::{token, Address, Env, Event};
@@ -157,6 +161,7 @@ fn test_top_up() {
 }
 
 #[test]
+fn test_cliff_based_access_no_threshold() {
 #[should_panic(expected = "cannot cancel stream: minimum duration not met")]
 fn test_cancel_before_minimum_duration() {
 
@@ -188,6 +193,12 @@ fn test_group_subscribe_and_collect_split() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    assert!(client.has_unlocked_access(&subscriber, &creator));
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 2);
+}
+
+#[test]
+fn test_cliff_based_access_before_threshold() {
     // Subscribe at timestamp 100
     env.ledger().set_timestamp(100);
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
@@ -275,6 +286,22 @@ fn test_group_cancel_collects_and_refunds_remaining_balance() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    client.set_cliff_threshold(&creator, &50);
+    assert_eq!(client.get_cliff_threshold(&creator), 50);
+
+    assert!(!client.has_unlocked_access(&subscriber, &creator));
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 0);
+
+    client.subscribe(&subscriber, &creator, &token.address, &30, &1);
+    env.ledger().set_timestamp(100);
+    client.collect(&subscriber, &creator);
+
+    assert!(!client.has_unlocked_access(&subscriber, &creator));
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 0);
+}
+
+#[test]
+fn test_cliff_based_access_after_threshold() {
     // Subscribe at timestamp 100
     env.ledger().set_timestamp(100);
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
@@ -323,6 +350,22 @@ fn test_migrate_tier_upgrade_with_additional_deposit() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    client.set_cliff_threshold(&creator, &50);
+
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    assert!(!client.has_unlocked_access(&subscriber, &creator));
+
+    env.ledger().set_timestamp(100);
+    client.collect(&subscriber, &creator);
+
+    assert!(client.has_unlocked_access(&subscriber, &creator));
+    assert_eq!(client.get_total_streamed(&subscriber, &creator), 100);
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 1);
+}
+
+#[test]
+fn test_access_tiers() {
     env.ledger().set_timestamp(100);
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
 
@@ -385,11 +428,39 @@ fn test_group_requires_exactly_five_creators() {
 
     let token = create_token_contract(&env, &admin);
     let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &10000);
     token_admin.mint(&subscriber, &1000);
 
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    client.set_cliff_threshold(&creator, &50);
+
+    client.subscribe(&subscriber, &creator, &token.address, &60, &2);
+
+    env.ledger().set_timestamp(100);
+    client.collect(&subscriber, &creator);
+
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 1);
+    assert!(client.has_unlocked_access(&subscriber, &creator));
+
+    client.top_up(&subscriber, &creator, &200);
+    env.ledger().set_timestamp(200);
+    client.collect(&subscriber, &creator);
+
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 2);
+    assert!(client.has_unlocked_access(&subscriber, &creator));
+
+    client.top_up(&subscriber, &creator, &300);
+    env.ledger().set_timestamp(400);
+    client.collect(&subscriber, &creator);
+
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 3);
+    assert!(client.has_unlocked_access(&subscriber, &creator));
+}
+
+#[test]
+fn test_total_streamed_tracking() {
     // Subscribe at timestamp 100
     env.ledger().set_timestamp(100);
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
@@ -485,6 +556,16 @@ fn test_group_percentages_must_sum_to_100() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    env.ledger().set_timestamp(100);
+    client.collect(&subscriber, &creator);
+    assert_eq!(client.get_total_streamed(&subscriber, &creator), 100);
+
+    client.top_up(&subscriber, &creator, &50);
+    env.ledger().set_timestamp(150);
+    client.collect(&subscriber, &creator);
+    assert_eq!(client.get_total_streamed(&subscriber, &creator), 150);
     // Subscribe at timestamp 100
     env.ledger().set_timestamp(100);
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);

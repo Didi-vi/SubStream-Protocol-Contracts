@@ -1,4 +1,6 @@
 #![no_std]
+use soroban_sdk::token::Client as TokenClient;
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 use soroban_sdk::{ contract, contractimpl, contracttype, Address, Env };
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Vec};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
@@ -11,6 +13,9 @@ const MINIMUM_FLOW_DURATION: u64 = 86400;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    Stream(Address, Address),        // (subscriber, creator)
+    TotalStreamed(Address, Address), // (subscriber, creator) - cumulative tokens streamed
+    CliffThreshold(Address),         // creator -> threshold amount for access
     Stream(Address, Address),      // (subscriber, creator)
     CreatorSubscribers(Address),   // creator -> Vec<subscriber>
     Stream(Address, Address), // (subscriber, stream_id)
@@ -169,6 +174,7 @@ fn subscribe_internal(
             stream.last_collected = current_time;
 
             env.storage().persistent().set(&key, &stream);
+            Self::update_total_streamed(&env, &subscriber, &creator, amount_to_collect);
         }
 fn collect_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
     let key = stream_key(subscriber, stream_id);
@@ -499,6 +505,63 @@ impl SubStreamContract {
         }
 
         total_collected
+    }
+
+    pub fn set_cliff_threshold(env: Env, creator: Address, threshold: i128) {
+        creator.require_auth();
+        if threshold < 0 {
+            panic!("threshold must be non-negative");
+        }
+        let key = DataKey::CliffThreshold(creator.clone());
+        env.storage().persistent().set(&key, &threshold);
+    }
+
+    pub fn get_cliff_threshold(env: Env, creator: Address) -> i128 {
+        let key = DataKey::CliffThreshold(creator.clone());
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    pub fn get_total_streamed(env: Env, subscriber: Address, creator: Address) -> i128 {
+        let key = DataKey::TotalStreamed(subscriber.clone(), creator.clone());
+        env.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    pub fn has_unlocked_access(env: Env, subscriber: Address, creator: Address) -> bool {
+        let threshold_key = DataKey::CliffThreshold(creator.clone());
+        let threshold: i128 = env.storage().persistent().get(&threshold_key).unwrap_or(0);
+        if threshold == 0 {
+            return true;
+        }
+        let streamed_key = DataKey::TotalStreamed(subscriber.clone(), creator.clone());
+        let total_streamed: i128 = env.storage().persistent().get(&streamed_key).unwrap_or(0);
+        total_streamed >= threshold
+    }
+
+    pub fn get_access_tier(env: Env, subscriber: Address, creator: Address) -> u32 {
+        let threshold_key = DataKey::CliffThreshold(creator.clone());
+        let threshold: i128 = env.storage().persistent().get(&threshold_key).unwrap_or(0);
+        if threshold == 0 {
+            return 2;
+        }
+        let streamed_key = DataKey::TotalStreamed(subscriber.clone(), creator.clone());
+        let total_streamed: i128 = env.storage().persistent().get(&streamed_key).unwrap_or(0);
+
+        if total_streamed >= 500 {
+            3
+        } else if total_streamed >= 200 {
+            2
+        } else if total_streamed >= 50 {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn update_total_streamed(env: &Env, subscriber: &Address, creator: &Address, amount: i128) {
+        let key = DataKey::TotalStreamed(subscriber.clone(), creator.clone());
+        let current_total: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_total = current_total + amount;
+        env.storage().persistent().set(&key, &new_total);
     }
 }
 
