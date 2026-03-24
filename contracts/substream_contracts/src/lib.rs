@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::contractevent;
 use soroban_sdk::token::Client as TokenClient;
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Bytes, Env, Vec};
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Vec};
 
 use soroban_sdk::token::Client as TokenClient;
@@ -15,6 +16,11 @@ const FREE_TRIAL_DURATION: u64 = 7 * 24 * 60 * 60;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    Stream(Address, Address),        // (subscriber, stream_id)
+    TotalStreamed(Address, Address), // (subscriber, creator) - cumulative tokens streamed
+    CliffThreshold(Address),         // creator -> threshold amount for access
+    CreatorSubscribers(Address),     // creator -> Vec<subscriber>
+    CreatorMetadata(Address),        // creator -> IPFS CID bytes
     Stream(Address, Address),        // (subscriber, creator)
     TotalStreamed(Address, Address), // (subscriber, creator)
     CliffThreshold(Address),         // creator -> threshold amount for access
@@ -208,6 +214,21 @@ fn subscribe_internal(
         percentages,
     };
 
+    env.storage().persistent().set(&key, &stream);
+
+    // Track subscriber under this stream_id for withdraw_all
+    let creator_key = DataKey::CreatorSubscribers(stream_id.clone());
+    let mut subs: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&creator_key)
+        .unwrap_or(vec![env]);
+    subs.push_back(subscriber.clone());
+    env.storage().persistent().set(&creator_key, &subs);
+}
+
+fn collect_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
+    let key = stream_key(subscriber, stream_id);
     set_stream(env, &key, &stream);
 }
 
@@ -261,6 +282,8 @@ fn distribute_and_collect(
         return 0;
     }
 
+    let time_elapsed = (current_time - stream.last_collected) as i128;
+    let mut amount_to_collect = time_elapsed * stream.rate_per_second;
     if let Some(creator) = total_streamed_creator {
         if is_creator_paused(env, creator) {
             // While paused, advance accounting clock so paused time is never billed.
@@ -296,6 +319,35 @@ fn distribute_and_collect(
         amount_to_collect = stream.balance;
     }
 
+    if amount_to_collect > 0 {
+        let token_client = TokenClient::new(env, &stream.token);
+        let mut remaining = amount_to_collect;
+        let creators_len = stream.creators.len();
+
+        for i in 0..creators_len {
+            let creator = stream.creators.get(i).unwrap();
+            let payout = if (i + 1) == creators_len {
+                remaining
+            } else {
+                let percentage = stream.percentages.get(i).unwrap() as i128;
+                let amount = (amount_to_collect * percentage) / 100;
+                remaining -= amount;
+                amount
+            };
+
+            if payout > 0 {
+                token_client.transfer(&env.current_contract_address(), &creator, &payout);
+            }
+        }
+
+        stream.balance -= amount_to_collect;
+        stream.last_collected = current_time;
+        env.storage().persistent().set(&key, &stream);
+
+        // Update cumulative streamed for each creator
+        for i in 0..stream.creators.len() {
+            let creator = stream.creators.get(i).unwrap();
+            SubStreamContract::update_total_streamed(env, subscriber, &creator, amount_to_collect);
     if amount_to_collect <= 0 {
         return 0;
     }
@@ -352,6 +404,18 @@ fn cancel_group_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
         panic!("stream not found");
     }
 
+    // Check minimum flow duration
+    let stream: Stream = env.storage().persistent().get(&key).unwrap();
+    let current_time = env.ledger().timestamp();
+    if current_time < stream.start_time + MINIMUM_FLOW_DURATION {
+        let remaining_time = stream.start_time + MINIMUM_FLOW_DURATION - current_time;
+        panic!(
+            "cannot cancel stream: minimum duration not met. {} seconds remaining",
+            remaining_time
+        );
+    }
+
+    collect_internal(env, subscriber, stream_id);
     distribute_and_collect(env, subscriber, stream_id, None);
 
     let stream = get_stream(env, &key);
@@ -360,6 +424,23 @@ fn cancel_group_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
         token_client.transfer(&env.current_contract_address(), subscriber, &stream.balance);
     }
 
+    env.storage().persistent().remove(&key);
+
+    // Remove subscriber from stream_id's subscriber list
+    let creator_key = DataKey::CreatorSubscribers(stream_id.clone());
+    if let Some(subs) = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<Address>>(&creator_key)
+    {
+        let mut updated: Vec<Address> = vec![env];
+        for s in subs.iter() {
+            if s != *subscriber {
+                updated.push_back(s);
+            }
+        }
+        env.storage().persistent().set(&creator_key, &updated);
+    }
     remove_stream(env, &key);
 }
 
@@ -658,6 +739,16 @@ impl SubStreamContract {
         }
     }
 
+    /// Collect from all active streams for a creator in a single call.
+    /// `max_count` caps the batch size to avoid hitting ledger instruction limits.
+    /// Returns the total amount collected across all processed streams.
+    pub fn withdraw_all(env: Env, creator: Address, max_count: u32) -> i128 {
+        let creator_key = DataKey::CreatorSubscribers(creator.clone());
+        let subs: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&creator_key)
+            .unwrap_or(vec![&env]);
     /// Collect from a creator's active streams in a batch.
     pub fn withdraw_all(env: Env, creator: Address, max_count: u32) -> i128 {
         let subs_key = DataKey::CreatorSubscribers(creator.clone());
@@ -679,6 +770,25 @@ impl SubStreamContract {
             }
         }
 
+        // Single transfer of the total collected amount to the creator
+        if total_collected > 0 {
+            for i in 0..limit {
+                let subscriber = subs.get(i as u32).unwrap();
+                let stream_key = DataKey::Stream(subscriber.clone(), creator.clone());
+                if env.storage().persistent().has(&stream_key) {
+                    let stream: Stream = env.storage().persistent().get(&stream_key).unwrap();
+                    let token_client = TokenClient::new(&env, &stream.token);
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &creator,
+                        &total_collected,
+                    );
+                    break;
+                }
+            }
+        }
+
+        total_collected
         total
     }
 
@@ -699,6 +809,20 @@ impl SubStreamContract {
             .persistent()
             .get(&DataKey::CliffThreshold(creator))
             .unwrap_or(0)
+    }
+
+    /// Store an IPFS CID pointing to the creator's profile, links, and tier descriptions.
+    /// Only the creator themselves can update their own metadata.
+    pub fn set_creator_metadata(env: Env, creator: Address, cid: Bytes) {
+        creator.require_auth();
+        let key = DataKey::CreatorMetadata(creator.clone());
+        env.storage().persistent().set(&key, &cid);
+    }
+
+    /// Retrieve the IPFS CID for a creator. Returns None if not set.
+    pub fn get_creator_metadata(env: Env, creator: Address) -> Option<Bytes> {
+        let key = DataKey::CreatorMetadata(creator.clone());
+        env.storage().persistent().get(&key)
     }
 
     pub fn get_total_streamed(env: Env, subscriber: Address, creator: Address) -> i128 {
@@ -859,6 +983,12 @@ fn cancel_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
     env.storage().persistent().remove(&key);
 }
 
+    fn update_total_streamed(env: &Env, subscriber: &Address, creator: &Address, amount: i128) {
+        let key = DataKey::TotalStreamed(subscriber.clone(), creator.clone());
+        let current_total: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&key, &(current_total + amount));
 fn top_up_internal(env: &Env, subscriber: &Address, stream_id: &Address, amount: i128) {
     subscriber.require_auth();
     if amount <= 0 {

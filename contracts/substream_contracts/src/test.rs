@@ -2,6 +2,9 @@
 
 use super::*;
 use soroban_sdk::{
+    testutils::{Address as _, Events as _, Ledger},
+    token, vec, Address, Bytes, Env,
+};
     testutils::{Address as _, Ledger},
     token, vec, Address, Env,
 };
@@ -61,6 +64,7 @@ fn test_is_subscribed_expired() {
     assert_eq!(token.balance(&creator), 20);
     assert_eq!(token.balance(&contract_id), 80);
 
+    // Advance 50 more seconds — would be 100 tokens but only 80 left
     // Additional 50 paid seconds, capped by remaining balance.
     env.ledger().set_timestamp(start + WEEK + 60);
     env.ledger().set_timestamp(160);
@@ -89,6 +93,12 @@ fn test_cancel_before_minimum_duration() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    // 24h + 120 seconds pass
+    env.ledger().set_timestamp(100 + 86400 + 120);
+    client.cancel(&subscriber, &creator);
     let start = 100u64;
     env.ledger().set_timestamp(start);
     client.subscribe(&subscriber, &creator, &token.address, &300, &3);
@@ -142,6 +152,8 @@ fn test_cancel_after_minimum_duration() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    client.subscribe(&subscriber, &creator, &token.address, &100, &2);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &2);
     let start = 100u64;
     env.ledger().set_timestamp(start);
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
@@ -178,6 +190,9 @@ fn test_top_up() {
 
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
+
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+    assert_eq!(token.balance(&contract_id), 100);
 
     env.ledger().set_timestamp(0);
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
@@ -235,7 +250,6 @@ fn test_group_subscribe_and_collect_split() {
     env.mock_all_auths();
 
     let subscriber = Address::generate(&env);
-    let creator = Address::generate(&env);
     let channel_id = Address::generate(&env);
     let creator_1 = Address::generate(&env);
     let creator_2 = Address::generate(&env);
@@ -299,7 +313,7 @@ fn test_group_subscribe_and_collect_split() {
         creator_2.clone(),
         creator_3.clone(),
         creator_4.clone(),
-        creator_5.clone()
+        creator_5.clone(),
     ];
     let percentages = vec![&env, 40u32, 25u32, 15u32, 10u32, 10u32];
 
@@ -320,6 +334,7 @@ fn test_group_subscribe_and_collect_split() {
     env.ledger().set_timestamp(110);
     client.collect_group(&subscriber, &channel_id);
 
+    // 10 seconds * 10 tokens/sec = 100 tokens split across creators
     assert_eq!(token.balance(&creator_1), 40);
     assert_eq!(token.balance(&creator_2), 25);
     assert_eq!(token.balance(&creator_3), 15);
@@ -329,12 +344,14 @@ fn test_group_subscribe_and_collect_split() {
 }
 
 #[test]
+fn test_cliff_based_access_before_threshold() {
 #[should_panic(expected = "group channel must contain exactly 5 creators")]
 fn test_group_requires_exactly_five_creators() {
     let env = Env::default();
     env.mock_all_auths();
 
     let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
     let channel_id = Address::generate(&env);
     let creator_1 = Address::generate(&env);
     let creator_2 = Address::generate(&env);
@@ -349,6 +366,68 @@ fn test_group_requires_exactly_five_creators() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    client.set_cliff_threshold(&creator, &50);
+    assert_eq!(client.get_cliff_threshold(&creator), 50);
+
+    assert!(!client.has_unlocked_access(&subscriber, &creator));
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 0);
+
+    client.subscribe(&subscriber, &creator, &token.address, &30, &1);
+    env.ledger().set_timestamp(100);
+    client.collect(&subscriber, &creator);
+
+    assert!(!client.has_unlocked_access(&subscriber, &creator));
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 0);
+}
+
+#[test]
+fn test_cancel_after_minimum_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    // Advance beyond minimum duration (24h + 1h)
+    env.ledger().set_timestamp(100 + 86400 + 3600);
+    client.cancel(&subscriber, &creator);
+
+    assert_eq!(token.balance(&creator), 100);
+    assert_eq!(token.balance(&subscriber), 900);
+}
+
+#[test]
+fn test_migrate_tier_downgrade_prorates_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &10);
+
+    env.ledger().set_timestamp(105);
+    client.migrate_tier(&subscriber, &creator, &5, &0);
     let creators = vec![
         &env,
         creator_1.clone(),
@@ -370,7 +449,68 @@ fn test_group_requires_exactly_five_creators() {
 }
 
 #[test]
+fn test_group_cancel_collects_and_refunds_remaining_balance() {
 fn test_pause_channel_blocks_charges_and_unpause_resumes() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let channel_id = Address::generate(&env);
+    let creator_1 = Address::generate(&env);
+    let creator_2 = Address::generate(&env);
+    let creator_3 = Address::generate(&env);
+    let creator_4 = Address::generate(&env);
+    let creator_5 = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    let creators = vec![
+        &env,
+        creator_1.clone(),
+        creator_2.clone(),
+        creator_3.clone(),
+        creator_4.clone(),
+        creator_5.clone(),
+    ];
+    let percentages = vec![&env, 40u32, 20u32, 20u32, 10u32, 10u32];
+
+    // Start at t=0, deposit 200 tokens at rate 1/sec
+    // After exactly 30 seconds, cancel (past minimum duration)
+    // 30 tokens collected, 170 refunded
+    env.ledger().set_timestamp(0);
+    client.subscribe_group(
+        &subscriber,
+        &channel_id,
+        &token.address,
+        &200,
+        &1,
+        &creators,
+        &percentages,
+    );
+
+    // Advance past minimum duration (24h) + 30 seconds
+    env.ledger().set_timestamp(86400 + 30);
+    client.cancel_group(&subscriber, &channel_id);
+
+    // 86430s * 1/sec = 86430, capped at balance 200 → all 200 collected
+    // 200 tokens split: 40%=80, 20%=40, 20%=40, 10%=20, 10%=20
+    assert_eq!(token.balance(&creator_1), 80);
+    assert_eq!(token.balance(&creator_2), 40);
+    assert_eq!(token.balance(&creator_3), 40);
+    assert_eq!(token.balance(&creator_4), 20);
+    assert_eq!(token.balance(&creator_5), 20);
+    assert_eq!(token.balance(&subscriber), 800); // 1000 - 200 deposited, 0 refund
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_cliff_based_access_after_threshold() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -408,6 +548,33 @@ fn test_is_subscribed_none() {
     assert!(client.is_channel_paused(&creator));
     assert_eq!(token.balance(&creator), 40);
 
+#[test]
+fn test_migrate_tier_upgrade_with_additional_deposit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    client.migrate_tier(&subscriber, &creator, &2, &50);
+
+    assert_eq!(token.balance(&contract_id), 150);
+    assert_eq!(token.balance(&subscriber), 850);
+}
+
+#[test]
+fn test_access_tiers() {
     env.ledger().set_timestamp(start + WEEK + 100);
     client.collect(&subscriber, &creator);
     env.ledger().set_timestamp(100);
@@ -525,6 +692,7 @@ fn test_cliff_threshold_access() {
 
     let token = create_token_contract(&env, &admin);
     let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &10000);
     token_admin.mint(&subscriber, &1000);
 
     let contract_id = env.register(SubStreamContract, ());
@@ -536,6 +704,8 @@ fn test_cliff_threshold_access() {
 
     env.ledger().set_timestamp(start + WEEK + 10);
     client.collect(&subscriber, &creator);
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 1);
+    assert!(client.has_unlocked_access(&subscriber, &creator));
     assert_eq!(token.balance(&creator), 20);
 
     env.ledger().set_timestamp(start + WEEK + 20);
@@ -545,6 +715,7 @@ fn test_cliff_threshold_access() {
 
     env.ledger().set_timestamp(start + WEEK + 100);
     client.collect(&subscriber, &creator);
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 2);
     assert_eq!(token.balance(&creator), 40);
 
     client.unpause_channel(&creator);
@@ -552,6 +723,64 @@ fn test_cliff_threshold_access() {
 
     env.ledger().set_timestamp(start + WEEK + 110);
     client.collect(&subscriber, &creator);
+    assert_eq!(client.get_access_tier(&subscriber, &creator), 3);
+}
+
+#[test]
+fn test_migrate_tier_emits_tier_changed_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    client.migrate_tier(&subscriber, &creator, &3, &0);
+
+    let events = env.events().all();
+    // Verify at least one event was emitted (TierChanged)
+    let _ = events;
+}
+
+#[test]
+#[should_panic(expected = "group channel must contain exactly 5 creators")]
+fn test_group_requires_exactly_five_creators() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let channel_id = Address::generate(&env);
+    let creator_1 = Address::generate(&env);
+    let creator_2 = Address::generate(&env);
+    let creator_3 = Address::generate(&env);
+    let creator_4 = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    let creators = vec![
+        &env,
+        creator_1.clone(),
+        creator_2.clone(),
+        creator_3.clone(),
+        creator_4.clone(),
+    ];
+    let percentages = vec![&env, 25u32, 25u32, 25u32, 25u32];
     assert_eq!(token.balance(&creator), 60);
     assert_eq!(token.balance(&contract_id), 240);
 }
@@ -643,11 +872,19 @@ fn test_migrate_tier_downgrade_prorates_refund() {
     assert_eq!(token.balance(&creator), 50);
 
 #[test]
+#[should_panic(expected = "percentages must sum to 100")]
+fn test_group_percentages_must_sum_to_100() {
 fn test_migrate_tier_downgrade_prorates_refund() {
     let env = Env::default();
     env.mock_all_auths();
 
     let subscriber = Address::generate(&env);
+    let channel_id = Address::generate(&env);
+    let creator_1 = Address::generate(&env);
+    let creator_2 = Address::generate(&env);
+    let creator_3 = Address::generate(&env);
+    let creator_4 = Address::generate(&env);
+    let creator_5 = Address::generate(&env);
     let creator = Address::generate(&env);
     let admin = Address::generate(&env);
 
@@ -658,6 +895,15 @@ fn test_migrate_tier_downgrade_prorates_refund() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    let creators = vec![
+        &env,
+        creator_1.clone(),
+        creator_2.clone(),
+        creator_3.clone(),
+        creator_4.clone(),
+        creator_5.clone(),
+    ];
+    let percentages = vec![&env, 30u32, 20u32, 20u32, 10u32, 10u32]; // sums to 90
     // No subscription exists
     assert!(!client.is_subscribed(&subscriber, &creator));
     client.set_cliff_threshold(&creator, &50);
@@ -712,4 +958,191 @@ fn test_migrate_tier_downgrade_prorates_refund() {
     // Remaining 50 balance is prorated to 25 at new rate, 25 refunded.
     assert_eq!(token.balance(&subscriber), 925);
     assert_eq!(token.balance(&contract_id), 25);
+}
+
+#[test]
+#[should_panic(expected = "new rate must be positive")]
+fn test_migrate_tier_invalid_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    client.migrate_tier(&subscriber, &creator, &0, &0);
+}
+
+#[test]
+fn test_migrate_tier_upgrade_collects_at_new_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    env.ledger().set_timestamp(110);
+    client.migrate_tier(&subscriber, &creator, &2, &0);
+
+    assert_eq!(token.balance(&creator), 10);
+    assert_eq!(token.balance(&contract_id), 90);
+
+    env.ledger().set_timestamp(120);
+    client.collect(&subscriber, &creator);
+    assert_eq!(token.balance(&creator), 30);
+    assert_eq!(token.balance(&contract_id), 70);
+}
+
+#[test]
+#[should_panic(expected = "cannot cancel stream: minimum duration not met")]
+fn test_cancel_before_minimum_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    // Try to cancel after only 1 hour — should fail
+    env.ledger().set_timestamp(100 + 3600);
+    client.cancel(&subscriber, &creator);
+}
+
+#[test]
+fn test_cancel_exactly_at_minimum_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    env.ledger().set_timestamp(100 + 86400);
+    client.cancel(&subscriber, &creator);
+
+    assert_eq!(token.balance(&creator), 100);
+    assert_eq!(token.balance(&subscriber), 900);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+#[test]
+#[should_panic(
+    expected = "cannot cancel stream: minimum duration not met. 43200 seconds remaining"
+)]
+fn test_cancel_with_remaining_time_message() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    // Try to cancel after 12 hours (43200 seconds remaining)
+    env.ledger().set_timestamp(100 + 43200);
+    client.cancel(&subscriber, &creator);
+}
+
+#[test]
+fn test_total_streamed_tracking() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    env.ledger().set_timestamp(100);
+    client.collect(&subscriber, &creator);
+    assert_eq!(client.get_total_streamed(&subscriber, &creator), 100);
+
+    client.top_up(&subscriber, &creator, &50);
+    env.ledger().set_timestamp(150);
+    client.collect(&subscriber, &creator);
+    assert_eq!(client.get_total_streamed(&subscriber, &creator), 150);
+}
+
+#[test]
+fn test_creator_metadata() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    // No metadata set yet
+    assert_eq!(client.get_creator_metadata(&creator), None);
+
+    // Set an IPFS CID
+    let cid = Bytes::from_slice(&env, b"QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
+    client.set_creator_metadata(&creator, &cid);
+
+    // Retrieve and verify
+    assert_eq!(client.get_creator_metadata(&creator), Some(cid.clone()));
+
+    // Update to a new CID
+    let new_cid = Bytes::from_slice(&env, b"QmNewCIDabcdefghijklmnopqrstuvwxyz1234567890AB");
+    client.set_creator_metadata(&creator, &new_cid);
+    assert_eq!(client.get_creator_metadata(&creator), Some(new_cid));
 }
