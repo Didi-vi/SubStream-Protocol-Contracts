@@ -288,6 +288,18 @@
                   },
                   {
                     "key": {
+                      "symbol": "rate_per_second"
+                    },
+                    "val": {
+                      "vec": [
+                        {
+                          "u32": 100
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "start_time"
                     },
                     "val": {

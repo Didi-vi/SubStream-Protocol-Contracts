@@ -32,6 +32,7 @@ fn test_subscribe_and_collect() {
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
+    env.ledger().set_timestamp(100);
     client.subscribe(&subscriber, &creator, &token.address, &100, &2);
 
     assert_eq!(token.balance(&subscriber), 900);
@@ -44,6 +45,7 @@ fn test_subscribe_and_collect() {
 
     // 10 paid seconds after trial.
     env.ledger().set_timestamp(start + WEEK + 10);
+    env.ledger().set_timestamp(110);
     client.collect(&subscriber, &creator);
 
     assert_eq!(token.balance(&creator), 20);
@@ -51,6 +53,7 @@ fn test_subscribe_and_collect() {
 
     // Additional 50 paid seconds, capped by remaining balance.
     env.ledger().set_timestamp(start + WEEK + 60);
+    env.ledger().set_timestamp(160);
     client.collect(&subscriber, &creator);
 
     assert_eq!(token.balance(&creator), 100);
@@ -60,6 +63,8 @@ fn test_subscribe_and_collect() {
 
 #[test]
 fn test_free_trial_ignores_claims_within_first_week() {
+#[should_panic(expected = "cannot cancel stream: minimum duration not met")]
+fn test_cancel_before_minimum_duration() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -137,6 +142,14 @@ fn test_cancel_after_minimum_duration() {
 
     assert_eq!(token.balance(&creator), 0);
     assert_eq!(token.balance(&subscriber), 1000);
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    env.ledger().set_timestamp(100 + 86400 + 10);
+    client.cancel(&subscriber, &creator);
+
+    assert_eq!(token.balance(&creator), 100);
+    assert_eq!(token.balance(&subscriber), 900);
     assert_eq!(token.balance(&contract_id), 0);
 }
 
@@ -161,6 +174,7 @@ fn test_top_up() {
     client.top_up(&subscriber, &creator, &50);
 
     env.ledger().set_timestamp(WEEK + 120);
+    env.ledger().set_timestamp(120);
     client.collect(&subscriber, &creator);
 
     assert_eq!(token.balance(&creator), 120);
@@ -200,6 +214,7 @@ fn test_group_subscribe_and_collect_split() {
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
+    env.ledger().set_timestamp(100);
     client.subscribe_group(
         &subscriber,
         &channel_id,
@@ -211,6 +226,7 @@ fn test_group_subscribe_and_collect_split() {
     );
 
     env.ledger().set_timestamp(start + WEEK + 10);
+    env.ledger().set_timestamp(110);
     client.collect_group(&subscriber, &channel_id);
 
     assert_eq!(token.balance(&creator_1), 40);
@@ -293,12 +309,29 @@ fn test_pause_channel_blocks_charges_and_unpause_resumes() {
 
     env.ledger().set_timestamp(start + WEEK + 100);
     client.collect(&subscriber, &creator);
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &300, &2);
+
+    env.ledger().set_timestamp(110);
+    client.collect(&subscriber, &creator);
+    assert_eq!(token.balance(&creator), 20);
+
+    env.ledger().set_timestamp(120);
+    client.pause_channel(&creator);
+    assert!(client.is_channel_paused(&creator));
+    // Pause settles the 10-second pending amount before freezing.
+    assert_eq!(token.balance(&creator), 40);
+
+    env.ledger().set_timestamp(200);
+    client.collect(&subscriber, &creator);
+    // No additional charges while paused.
     assert_eq!(token.balance(&creator), 40);
 
     client.unpause_channel(&creator);
     assert!(!client.is_channel_paused(&creator));
 
     env.ledger().set_timestamp(start + WEEK + 110);
+    env.ledger().set_timestamp(210);
     client.collect(&subscriber, &creator);
     assert_eq!(token.balance(&creator), 60);
     assert_eq!(token.balance(&contract_id), 240);
@@ -337,6 +370,21 @@ fn test_pause_channel_applies_to_all_subscribers() {
     env.ledger().set_timestamp(start + WEEK + 140);
     let total = client.withdraw_all(&creator, &10);
 
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber_1, &creator, &token.address, &200, &1);
+    client.subscribe(&subscriber_2, &creator, &token.address, &200, &1);
+
+    env.ledger().set_timestamp(130);
+    client.pause_channel(&creator);
+    assert_eq!(token.balance(&creator), 60);
+
+    env.ledger().set_timestamp(230);
+    client.unpause_channel(&creator);
+
+    env.ledger().set_timestamp(240);
+    let total = client.withdraw_all(&creator, &10);
+
+    // Only post-unpause 10 seconds are billable for each stream.
     assert_eq!(total, 20);
     assert_eq!(token.balance(&creator), 80);
     assert_eq!(token.balance(&contract_id), 320);
@@ -365,11 +413,17 @@ fn test_cliff_threshold_access() {
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
 
     env.ledger().set_timestamp(start + WEEK + 30);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    env.ledger().set_timestamp(130);
     client.collect(&subscriber, &creator);
     assert!(!client.has_unlocked_access(&subscriber, &creator));
     assert_eq!(client.get_access_tier(&subscriber, &creator), 0);
 
     env.ledger().set_timestamp(start + WEEK + 50);
+    env.ledger().set_timestamp(150);
     client.collect(&subscriber, &creator);
     assert!(client.has_unlocked_access(&subscriber, &creator));
     assert_eq!(client.get_access_tier(&subscriber, &creator), 1);
@@ -399,6 +453,32 @@ fn test_migrate_tier_downgrade_prorates_refund() {
     client.migrate_tier(&subscriber, &creator, &5, &0);
 
     assert_eq!(token.balance(&creator), 50);
+
+#[test]
+fn test_migrate_tier_downgrade_prorates_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &10);
+
+    env.ledger().set_timestamp(105);
+    client.migrate_tier(&subscriber, &creator, &5, &0);
+
+    // Collected at old rate before migration.
+    assert_eq!(token.balance(&creator), 50);
+    // Remaining 50 balance is prorated to 25 at new rate, 25 refunded.
     assert_eq!(token.balance(&subscriber), 925);
     assert_eq!(token.balance(&contract_id), 25);
 }

@@ -212,6 +212,10 @@ fn distribute_and_collect(
     let elapsed = (now - charge_start) as i128;
     let mut amount_to_collect = elapsed
         .checked_mul(stream.tier.rate_per_second)
+
+    let elapsed = (now - stream.last_collected) as i128;
+    let mut amount_to_collect = elapsed
+        .checked_mul(stream.rate_per_second)
         .expect("overflow");
 
     if amount_to_collect > stream.balance {
