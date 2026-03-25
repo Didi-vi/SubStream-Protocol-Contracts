@@ -1,5 +1,4 @@
 #![no_std]
-use soroban_sdk::contractevent;
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Bytes, Env, Vec};
 
@@ -48,6 +47,23 @@ pub struct TierChanged {
 }
 
 #[contractevent]
+pub struct Subscribed {
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub creator: Address,
+    pub rate_per_second: i128,
+}
+
+#[contractevent]
+pub struct Unsubscribed {
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub creator: Address,
+}
+
+#[contractevent]
 pub struct TipReceived {
     #[topic]
     pub user: Address,
@@ -63,23 +79,6 @@ pub struct SubStreamContract;
 
 fn stream_key(subscriber: &Address, stream_id: &Address) -> DataKey {
     DataKey::Stream(subscriber.clone(), stream_id.clone())
-}
-
-fn validate_distribution(creators: &Vec<Address>, percentages: &Vec<u32>, expected: u32) {
-    let creators_len = creators.len();
-    if creators_len != expected {
-        panic!("creator count mismatch");
-    }
-    
-    let mut total_percentage: u32 = 0;
-    for i in 0..creators_len {
-        let percentage = percentages.get(i as u32).unwrap();
-        total_percentage += percentage;
-    }
-    
-    if total_percentage != 100 {
-        panic!("percentages must sum to 100");
-    }
 }
 
 fn stream_exists(env: &Env, key: &DataKey) -> bool {
@@ -189,6 +188,12 @@ impl SubStreamContract {
         env.storage().persistent().set(&key, &stream);
 
         add_subscriber_to_creator(&env, &creator, &subscriber);
+
+        Subscribed {
+            subscriber: subscriber.clone(),
+            creator: creator.clone(),
+            rate_per_second,
+        }.publish(&env);
     }
 
     pub fn collect(env: Env, subscriber: Address, stream_id: Address) {
@@ -353,14 +358,12 @@ impl SubStreamContract {
         stream.tier.rate_per_second = new_rate_per_second;
         set_stream(&env, &key, &stream);
 
-        env.events().publish(
-            TierChanged {
-                subscriber: subscriber.clone(),
-                creator: creator.clone(),
-                old_rate,
-                new_rate: new_rate_per_second,
-            }
-        );
+        TierChanged {
+            subscriber: subscriber.clone(),
+            creator: creator.clone(),
+            old_rate,
+            new_rate: new_rate_per_second,
+        }.publish(&env);
     }
 
     /// Collect from all active streams for a creator in a single call.
@@ -482,10 +485,12 @@ impl SubStreamContract {
         token_client.transfer(&user, &creator, &amount);
         
         // Emit TipReceived event
-        env.events().publish(
-            (user.clone(), creator.clone(), token.clone()),
+        TipReceived {
+            user: user.clone(),
+            creator: creator.clone(),
+            token: token.clone(),
             amount,
-        );
+        }.publish(&env);
     }
 
     // Update total streamed amount for a subscriber-creator pair
@@ -580,6 +585,12 @@ fn subscribe_internal(
         subs.push_back(subscriber.clone());
         env.storage().persistent().set(&creator_key, &subs);
     }
+
+    Subscribed {
+        subscriber: subscriber.clone(),
+        creator: stream_id.clone(),
+        rate_per_second,
+    }.publish(&env);
 }
 
 fn distribute_and_collect(
@@ -722,14 +733,13 @@ fn cancel_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
         token_client.transfer(&env.current_contract_address(), subscriber, &stream.balance);
     }
     env.storage().persistent().remove(&key);
-}
 
-fn update_total_streamed(env: &Env, subscriber: &Address, creator: &Address, amount: i128) {
-    let key = DataKey::TotalStreamed(subscriber.clone(), creator.clone());
-    let current_total: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-    env.storage()
-        .persistent()
-        .set(&key, &(current_total + amount));
+    remove_subscriber_from_creator(env, stream_id, subscriber);
+
+    Unsubscribed {
+        subscriber: subscriber.clone(),
+        creator: stream_id.clone(),
+    }.publish(&env);
 }
 
 fn top_up_internal(env: &Env, subscriber: &Address, stream_id: &Address, amount: i128) {
@@ -779,21 +789,10 @@ fn cancel_group_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
     remove_stream(env, &key);
 
     // Remove subscriber from stream_id's subscriber list
-    let creator_key = DataKey::CreatorSubscribers(stream_id.clone());
-    if let Some(subs) = env
-        .storage()
-        .persistent()
-        .get::<DataKey, Vec<Address>>(&creator_key)
-    {
-        let mut updated: Vec<Address> = vec![env];
-        for s in subs.iter() {
-            if s != *subscriber {
-                updated.push_back(s);
-            }
-        }
-        env.storage().persistent().set(&creator_key, &updated);
-    }
-    remove_stream(env, &key);
-}
+    remove_subscriber_from_creator(env, stream_id, subscriber);
 
-mod test;
+    Unsubscribed {
+        subscriber: subscriber.clone(),
+        creator: stream_id.clone(),
+    }.publish(&env);
+}
