@@ -464,6 +464,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "last_funds_exhausted"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "payer"
                     },
                     "val": {
