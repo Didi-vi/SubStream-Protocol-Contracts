@@ -303,7 +303,11 @@ impl SubStreamContract {
             return false;
         }
         let sub: Subscription = env.storage().persistent().get(&key).unwrap();
+<<<<<<< selfsub
+        if sub.tier.rate_per_second <= 0 || sub.balance <= 0 {
+=======
         if sub.tier.rate_per_second <= 0 {
+>>>>>>> main
             return false;
         }
 
@@ -320,8 +324,15 @@ impl SubStreamContract {
         }
 
         let elapsed = (now - charge_start) as i128;
+<<<<<<< selfsub
+        let potential_charge = elapsed
+            .checked_mul(sub.tier.rate_per_second)
+            .unwrap_or(0);
+        
+=======
         let potential_charge = elapsed.checked_mul(sub.tier.rate_per_second).unwrap_or(0);
 
+>>>>>>> main
         if sub.balance > potential_charge {
             return true;
         }
@@ -653,7 +664,12 @@ impl SubStreamContract {
 
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&user, &creator, &amount);
+<<<<<<< selfsub
+        
+        // Emit TipReceived event
+=======
 
+>>>>>>> main
         TipReceived {
             user: user.clone(),
             creator: creator.clone(),
@@ -750,6 +766,12 @@ fn subscribe_core(
 ) {
     payer.require_auth();
 
+    for creator in creators.iter() {
+        if beneficiary == &creator {
+            panic!("Self-subscription not allowed");
+        }
+    }
+
     if amount <= 0 || rate_per_second <= 0 {
         panic!("amount and rate must be positive");
     }
@@ -777,9 +799,12 @@ fn subscribe_core(
         balance: amount,
         last_collected: now,
         start_time: now,
+<<<<<<< selfsub
+=======
         last_funds_exhausted: 0,
         creators: creators.clone(),
         percentages: percentages.clone(),
+>>>>>>> main
         payer: payer.clone(),
         beneficiary: beneficiary.clone(),
     };
@@ -869,6 +894,48 @@ fn distribute_and_collect(
 
         if payout > 0 {
             token_client.transfer(&env.current_contract_address(), &partner, &payout);
+<<<<<<< selfsub
+        }
+    }
+    // If balance is insufficient, check if we can still accrue debt (grace period).
+    if amount_to_collect >= stream.balance {
+        if stream.last_funds_exhausted == 0 {
+            // First time running out of funds
+            // Calculate more precise exhaustion time if possible, or just use now
+            stream.last_funds_exhausted = now;
+        } else {
+            let grace_period_end = stream.last_funds_exhausted.saturating_add(GRACE_PERIOD);
+            if now > grace_period_end {
+                // Grace period expired, cap collection at remaining balance (if any)
+                amount_to_collect = if stream.balance > 0 { stream.balance } else { 0 };
+            }
+        }
+    }
+
+    let available_balance = stream.balance.max(0);
+    let amount_to_transfer = amount_to_collect.min(available_balance);
+
+    if amount_to_transfer > 0 {
+        let token_client = TokenClient::new(env, &stream.token);
+        let mut remaining = amount_to_transfer;
+        let creators_len = stream.creators.len();
+
+        for i in 0..creators_len {
+            let creator = stream.creators.get(i).unwrap();
+            let payout = if (i + 1) == creators_len {
+                remaining
+            } else {
+                let percentage = stream.percentages.get(i).unwrap() as i128;
+                let amount = (amount_to_transfer * percentage) / 100;
+                remaining -= amount;
+                amount
+            };
+
+            if payout > 0 {
+                token_client.transfer(&env.current_contract_address(), &creator, &payout);
+            }
+=======
+>>>>>>> main
         }
     }
 
@@ -947,6 +1014,9 @@ fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount
 fn cancel_group_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
     cancel_internal(env, subscriber, stream_id);
 }
+<<<<<<< selfsub
+=======
 
 #[cfg(test)]
 mod test;
+>>>>>>> main
