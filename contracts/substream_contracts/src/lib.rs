@@ -50,6 +50,8 @@ pub enum DataKey {
     GiftsReceived(Address),
     CreatorSplit(Address),
     ContractAdmin,
+    ProtocolFeeBps,
+    Moderator(Address),
     VerifiedCreator(Address),
 }
 
@@ -130,13 +132,34 @@ impl SubStreamContract {
         env.storage().persistent().set(&DataKey::ContractAdmin, &admin);
     }
 
-    pub fn verify_creator(env: Env, admin: Address, creator: Address) {
+    pub fn verify_creator(env: Env, caller: Address, creator: Address) {
+        caller.require_auth();
+        let admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
+        let is_mod = env.storage().persistent().get(&DataKey::Moderator(caller.clone())).unwrap_or(false);
+        
+        if caller != admin && !is_mod { 
+            panic!("unauthorized: admin or moderator required"); 
+        }
+
+        env.storage().persistent().set(&DataKey::VerifiedCreator(creator.clone()), &true);
+        CreatorVerified { creator, verified_by: caller }.publish(&env);
+    }
+
+    pub fn set_moderator(env: Env, admin: Address, moderator: Address, status: bool) {
         admin.require_auth();
         let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
         if admin != stored_admin { panic!("admin only"); }
 
-        env.storage().persistent().set(&DataKey::VerifiedCreator(creator.clone()), &true);
-        CreatorVerified { creator, verified_by: admin }.publish(&env);
+        env.storage().persistent().set(&DataKey::Moderator(moderator), &status);
+    }
+
+    pub fn set_protocol_fee(env: Env, admin: Address, fee_bps: u32) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
+        if admin != stored_admin { panic!("admin only"); }
+        if fee_bps > 10000 { panic!("invalid fee bps"); }
+
+        env.storage().persistent().set(&DataKey::ProtocolFeeBps, &fee_bps);
     }
 
     pub fn is_creator_verified(env: Env, creator: Address) -> bool {

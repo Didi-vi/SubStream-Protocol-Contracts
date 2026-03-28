@@ -34,3 +34,16 @@ jobs:
 
       - name: Run Unit Tests
         run: cargo test
+
+      - name: Install tarpaulin
+        run: cargo install cargo-tarpaulin
+
+      - name: Run Code Coverage
+        run: |
+          cargo tarpaulin --out Lcov --output-dir coverage
+          
+      - name: Upload Coverage report
+        uses: actions/upload-artifact@v3
+        with:
+          name: code-coverage-report
+          path: coverage/lcov.info
